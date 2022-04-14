@@ -93,6 +93,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// TODO: sched.SchedulePod() is the function we want to accelerate with In-network Computing
 	scheduleResult, err := sched.SchedulePod(schedulingCycleCtx, fwk, state, pod)
 	if err != nil {
 		// SchedulePod() may have failed because the pod would not fit on any host, so we try to
@@ -321,7 +322,13 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, ErrNoNodesAvailable
 	}
 
-	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+	// feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+
+	// We replace findNodesThatFitPod() with networkAcceleratedPodScheduling()
+	// to offload the kubernetes scheduling to a programmable network device
+	// (e.g., switch, DPU). This function returns one node if the pod is
+	// schedulable and zero nodes otherwise.
+	feasibleNodes, diagnosis, err := sched.networkAcceleratedPodScheduling(ctx, fwk, state, pod)
 	if err != nil {
 		return result, err
 	}
@@ -357,6 +364,70 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
 		FeasibleNodes:  len(feasibleNodes),
 	}, err
+}
+
+func (sched *Scheduler) networkAcceleratedPodScheduling(ctx context.Context, fwk framework.Framework, state *framework.CycleState, pod *v1.Pod) ([]*v1.Node, framework.Diagnosis, error) {
+	diagnosis := framework.Diagnosis{
+		NodeToStatusMap:      make(framework.NodeToStatusMap),
+		UnschedulablePlugins: sets.NewString(),
+	}
+
+	// Run "prefilter" plugins.
+	preRes, s := fwk.RunPreFilterPlugins(ctx, state, pod)
+	allNodes, err := sched.nodeInfoSnapshot.NodeInfos().List()
+	if err != nil {
+		return nil, diagnosis, err
+	}
+	if !s.IsSuccess() {
+		if !s.IsUnschedulable() {
+			return nil, diagnosis, s.AsError()
+		}
+		// All nodes will have the same status. Some non trivial refactoring is
+		// needed to avoid this copy.
+		for _, n := range allNodes {
+			diagnosis.NodeToStatusMap[n.Node().Name] = s
+		}
+		// Status satisfying IsUnschedulable() gets injected into diagnosis.UnschedulablePlugins.
+		if s.FailedPlugin() != "" {
+			diagnosis.UnschedulablePlugins.Insert(s.FailedPlugin())
+		}
+		return nil, diagnosis, nil
+	}
+
+	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
+	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
+	if len(pod.Status.NominatedNodeName) > 0 {
+		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
+		if err != nil {
+			klog.ErrorS(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
+		}
+		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
+		if len(feasibleNodes) != 0 {
+			return feasibleNodes, diagnosis, nil
+		}
+	}
+
+	nodes := allNodes
+	if !preRes.AllNodes() {
+		nodes = make([]*framework.NodeInfo, 0, len(preRes.NodeNames))
+		for n := range preRes.NodeNames {
+			nInfo, err := sched.nodeInfoSnapshot.NodeInfos().Get(n)
+			if err != nil {
+				return nil, diagnosis, err
+			}
+			nodes = append(nodes, nInfo)
+		}
+	}
+	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+
+	feasibleNodes, err = findNodesThatPassExtenders(sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+	return feasibleNodes, diagnosis, nil
 }
 
 // Filters the nodes to find the ones that fit the pod based on the framework
